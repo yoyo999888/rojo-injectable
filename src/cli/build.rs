@@ -11,6 +11,7 @@ use memofs::Vfs;
 use roblox_install::RobloxStudio;
 use tokio::runtime::Runtime;
 
+use crate::merge;
 use crate::serve_session::ServeSession;
 
 use super::resolve_path;
@@ -38,6 +39,12 @@ pub struct BuildCommand {
     /// Should end in .rbxm or .rbxl.
     #[clap(long, short, conflicts_with = "output")]
     pub plugin: Option<PathBuf>,
+
+    /// Path to an existing .rbxl/.rbxlx/.rbxm/.rbxmx file to merge with.
+    /// When provided, the Rojo project tree is merged into this file
+    /// instead of building from scratch.
+    #[clap(long)]
+    pub merge: Option<PathBuf>,
 
     /// Whether to automatically rebuild when any input files change.
     #[clap(long)]
@@ -84,7 +91,12 @@ impl BuildCommand {
         let session = ServeSession::new(vfs, project_path)?;
         let mut cursor = session.message_queue().cursor();
 
-        write_model(&session, &output_path, output_kind)?;
+        if let Some(merge_path) = &self.merge {
+            let merge_path = resolve_path(merge_path);
+            write_merged(&session, &merge_path, &output_path, output_kind)?;
+        } else {
+            write_model(&session, &output_path, output_kind)?;
+        }
 
         if self.watch {
             let rt = Runtime::new().unwrap();
@@ -94,7 +106,12 @@ impl BuildCommand {
                 let (new_cursor, _patch_set) = rt.block_on(receiver).unwrap();
                 cursor = new_cursor;
 
-                write_model(&session, &output_path, output_kind)?;
+                if let Some(merge_path) = &self.merge {
+                    let merge_path = resolve_path(merge_path);
+                    write_merged(&session, &merge_path, &output_path, output_kind)?;
+                } else {
+                    write_model(&session, &output_path, output_kind)?;
+                }
             }
         }
 
@@ -148,6 +165,67 @@ impl OutputKind {
 
 fn xml_encode_config() -> rbx_xml::EncodeOptions<'static> {
     rbx_xml::EncodeOptions::new().property_behavior(rbx_xml::EncodePropertyBehavior::WriteUnknown)
+}
+
+/// 读取已有文件，将 Rojo project tree 合并进去，输出到 output_path。
+#[profiling::function]
+fn write_merged(
+    session: &ServeSession,
+    merge_path: &Path,
+    output: &Path,
+    output_kind: OutputKind,
+) -> anyhow::Result<()> {
+    println!(
+        "Merging project '{}' into '{}'",
+        session.project_name(),
+        merge_path.display()
+    );
+
+    log::trace!("Reading base file: {}", merge_path.display());
+    let base_dom = merge::read_place_file(merge_path)?;
+
+    log::trace!("Merging Rojo project into base");
+    let tree = session.tree();
+    let merged_dom = merge::merge_into(base_dom, tree.inner())?;
+
+    log::trace!("Opening output file for write");
+    let mut file = BufWriter::new(File::create(output)?);
+
+    let root = merged_dom.root();
+    match output_kind {
+        OutputKind::Rbxm => {
+            rbx_binary::to_writer(&mut file, &merged_dom, &[root.referent()])?;
+        }
+        OutputKind::Rbxl => {
+            rbx_binary::to_writer(&mut file, &merged_dom, root.children())?;
+        }
+        OutputKind::Rbxmx => {
+            rbx_xml::to_writer(
+                &mut file,
+                &merged_dom,
+                &[root.referent()],
+                xml_encode_config(),
+            )?;
+        }
+        OutputKind::Rbxlx => {
+            rbx_xml::to_writer(
+                &mut file,
+                &merged_dom,
+                root.children(),
+                xml_encode_config(),
+            )?;
+        }
+    }
+
+    file.flush()?;
+
+    let filename = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<invalid utf-8>");
+    println!("Merged and built project to {}", filename);
+
+    Ok(())
 }
 
 #[profiling::function]
